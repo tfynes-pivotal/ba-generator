@@ -16,6 +16,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
@@ -120,7 +121,31 @@ type GraphQLResponse struct {
 }
 
 type GraphQLError struct {
-	Message string `json:"message"`
+	Message    string                 `json:"message"`
+	ErrorMsg   string                 `json:"errorMsg"`
+	ErrorType  string                 `json:"errorType"`
+	EntityID   string                 `json:"entityId"`
+	EntityName string                 `json:"entityName"`
+	Extensions map[string]interface{} `json:"extensions"`
+}
+
+func (e GraphQLError) Error() string {
+	if e.ErrorMsg != "" {
+		return e.ErrorMsg
+	}
+	return e.Message
+}
+
+// newHTTPClient returns an http.Client, optionally skipping TLS verification.
+func newHTTPClient(skipTLS bool) *http.Client {
+	if !skipTLS {
+		return &http.Client{}
+	}
+	return &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+		},
+	}
 }
 
 // HubClient handles authenticated GraphQL requests to Hub.
@@ -128,19 +153,21 @@ type HubClient struct {
 	endpoint   string
 	authToken  string
 	httpClient *http.Client
+	debug      bool
 }
 
 // NewHubClient constructs a HubClient for the given endpoint and bearer token.
-func NewHubClient(endpoint, authToken string) *HubClient {
+func NewHubClient(endpoint, authToken string, skipTLS, debug bool) *HubClient {
 	return &HubClient{
 		endpoint:   endpoint,
 		authToken:  authToken,
-		httpClient: &http.Client{},
+		httpClient: newHTTPClient(skipTLS),
+		debug:      debug,
 	}
 }
 
 // GenerateAccessToken fetches a short-lived OAuth access token from Hub.
-func GenerateAccessToken(endpoint, appID, appSecret string) (string, error) {
+func GenerateAccessToken(httpClient *http.Client, endpoint, appID, appSecret string) (string, error) {
 	query := fmt.Sprintf(`
 		mutation oauth {
 			authMutation {
@@ -160,7 +187,7 @@ func GenerateAccessToken(endpoint, appID, appSecret string) (string, error) {
 		return "", fmt.Errorf("error marshalling request: %v", err)
 	}
 
-	resp, err := http.Post(endpoint, "application/json", bytes.NewBuffer(reqBody))
+	resp, err := httpClient.Post(endpoint, "application/json", bytes.NewBuffer(reqBody))
 	if err != nil {
 		return "", fmt.Errorf("error sending request: %v", err)
 	}
@@ -209,6 +236,11 @@ func (c *HubClient) ExecuteQuery(query string, variables map[string]interface{})
 		return nil, fmt.Errorf("error marshalling request: %v", err)
 	}
 
+	if c.debug {
+		varJSON, _ := json.MarshalIndent(variables, "  ", "  ")
+		log.Printf("[DEBUG] GraphQL request to %s\n  query: %s\n  variables: %s", c.endpoint, strings.TrimSpace(query), varJSON)
+	}
+
 	httpReq, err := http.NewRequest("POST", c.endpoint, bytes.NewBuffer(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %v", err)
@@ -231,12 +263,26 @@ func (c *HubClient) ExecuteQuery(query string, variables map[string]interface{})
 		return nil, fmt.Errorf("error reading response: %v", err)
 	}
 
+	if c.debug {
+		log.Printf("[DEBUG] GraphQL response (HTTP %d): %s", resp.StatusCode, body)
+	}
+
 	var result GraphQLResponse
 	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("error parsing response: %v", err)
 	}
 	if len(result.Errors) > 0 {
-		return nil, fmt.Errorf("GraphQL errors: %v", result.Errors)
+		if c.debug {
+			for i, e := range result.Errors {
+				log.Printf("[DEBUG] GraphQL error[%d]: message=%q errorMsg=%q errorType=%q entityId=%q entityName=%q extensions=%v",
+					i, e.Message, e.ErrorMsg, e.ErrorType, e.EntityID, e.EntityName, e.Extensions)
+			}
+		}
+		msgs := make([]string, len(result.Errors))
+		for i, e := range result.Errors {
+			msgs[i] = e.Error()
+		}
+		return nil, fmt.Errorf("GraphQL errors: %s", strings.Join(msgs, "; "))
 	}
 	return &result, nil
 }
@@ -367,30 +413,33 @@ func getStr(m map[string]interface{}, key string) string {
 
 // Business application mutation
 
-const upsertBAMutation = `
-mutation UpsertBusinessApps($entityName: String!, $potentialBusinessApps: [EntityId!]!) {
+// UpsertBusinessApplication creates or updates a business application in Hub.
+// name is the display name for the BA; pbaIDs are the PotentialBusinessApplication
+// entity IDs that should be linked to it.
+//
+// The PBA IDs are embedded inline in the query document (not as variables) because
+// Hub's EntityId custom scalar does not coerce correctly when passed via variables.
+func (c *HubClient) UpsertBusinessApplication(name string, pbaIDs []string) (*BAUpsertResult, error) {
+	quotedIDs := make([]string, len(pbaIDs))
+	for i, id := range pbaIDs {
+		quotedIDs[i] = fmt.Sprintf("%q", id)
+	}
+	mutation := fmt.Sprintf(`
+mutation UpsertBusinessApps {
   businessAppMutation {
     upsertBusinessApplications(
       input: [{
-        entityName: $entityName
-        potentialBusinessApps: $potentialBusinessApps
+        entityName: %q
+        potentialBusinessApps: [%s]
       }]
     ) {
       entities { entityId }
       errors { entityId entityName errorMsg errorType }
     }
   }
-}`
+}`, name, strings.Join(quotedIDs, "\n        "))
 
-// UpsertBusinessApplication creates or updates a business application in Hub.
-// name is the display name for the BA; pbaIDs are the PotentialBusinessApplication
-// entity IDs that should be linked to it.
-func (c *HubClient) UpsertBusinessApplication(name string, pbaIDs []string) (*BAUpsertResult, error) {
-	vars := map[string]interface{}{
-		"entityName":            name,
-		"potentialBusinessApps": pbaIDs,
-	}
-	resp, err := c.ExecuteQuery(upsertBAMutation, vars)
+	resp, err := c.ExecuteQuery(mutation, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -481,6 +530,8 @@ func main() {
 		endpointFlag  string
 		tokenFlag     string
 		pageSize      int
+		insecure      bool
+		debug         bool
 	)
 
 	flag.BoolVar(&generateMode, "generate", false, "Generate business applications from matching TAS spaces")
@@ -492,6 +543,8 @@ func main() {
 	flag.StringVar(&endpointFlag, "endpoint", "", "GraphQL endpoint URL (overrides hub-api-config.json)")
 	flag.StringVar(&tokenFlag, "token", "", "OAuth access token (skips token generation if provided)")
 	flag.IntVar(&pageSize, "page-size", defaultPageSize, "Spaces fetched per API request")
+	flag.BoolVar(&insecure, "insecure", false, "Skip TLS certificate verification (useful for self-signed certs)")
+	flag.BoolVar(&debug, "debug", false, "Emit detailed debug logs for each GraphQL request and response")
 	flag.Parse()
 
 	if !generateMode && !listSpaces && !generateToken {
@@ -511,7 +564,7 @@ func main() {
 	// Resolve auth token
 	authToken := tokenFlag
 	if authToken == "" {
-		authToken, err = GenerateAccessToken(config.GraphQLEndpoint, config.OAuthAppID, config.OAuthAppSecret)
+		authToken, err = GenerateAccessToken(newHTTPClient(insecure), config.GraphQLEndpoint, config.OAuthAppID, config.OAuthAppSecret)
 		if err != nil {
 			log.Fatalf("Token error: %v", err)
 		}
@@ -522,7 +575,7 @@ func main() {
 		return
 	}
 
-	client := NewHubClient(config.GraphQLEndpoint, authToken)
+	client := NewHubClient(config.GraphQLEndpoint, authToken, insecure, debug)
 
 	// Compile regex
 	re, err := regexp.Compile(regexPattern)
