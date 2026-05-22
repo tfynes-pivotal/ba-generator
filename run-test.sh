@@ -1,0 +1,1 @@
+./ba-generator --list-spaces

@@ -20,8 +20,7 @@ mapping file enriches each identifier with a human-readable name.
 1. Authenticates to Hub via OAuth.
 2. Paginates through every `Tanzu.TAS.Space` entity across all attached foundations.
 3. For each space whose name matches the regex, extracts the identifier (e.g. `ad12345678`).
-4. Groups spaces by identifier, collecting their `PotentialBusinessApplication`
-   (PBA) entity IDs.
+4. Groups spaces by identifier, collecting the matching `Tanzu.TAS.Space` entity IDs.
 5. Optionally looks up a human-readable name for each identifier in a CSV file.
 6. Calls `upsertBusinessApplications` for each group, creating or updating the
    corresponding business application in Hub.

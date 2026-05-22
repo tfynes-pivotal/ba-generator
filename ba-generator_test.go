@@ -143,6 +143,14 @@ func TestExtractADID(t *testing.T) {
 	}
 }
 
+func TestExtractADIDWithFoo(t *testing.T) {
+	re := mustCompile(`foo`)
+	got := extractADID("bar-foo-baz", re)
+	if got != "foo" {
+		t.Fatalf("extractADID(%q) = %q; want %q", "bar-foo-baz", got, "foo")
+	}
+}
+
 func mustCompile(pattern string) *regexp.Regexp {
 	re, err := regexp.Compile(pattern)
 	if err != nil {

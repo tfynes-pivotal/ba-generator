@@ -289,12 +289,10 @@ func (c *HubClient) ExecuteQuery(query string, variables map[string]interface{})
 
 // Domain types
 
-// TASSpace represents a single TAS space entity returned from Hub, together
-// with the PotentialBusinessApplication entity IDs linked to it.
+// TASSpace represents a single TAS space entity returned from Hub.
 type TASSpace struct {
 	EntityID   string
 	EntityName string
-	PBAIDs     []string // PotentialBusinessApplication entity IDs
 }
 
 // BAUpsertResult carries the outcome of a single upsertBusinessApplications call.
@@ -322,12 +320,6 @@ query listTASSpaces($first: Int!, $after: String) {
       entities {
         entityId
         entityName
-        entitiesIn(entityType: "Tanzu.Hub.PotentialBusinessApplication") {
-          entities {
-            entityId
-            entityName
-          }
-        }
       }
     }
   }
@@ -386,22 +378,10 @@ func parseTASSpace(e interface{}) *TASSpace {
 	if !ok {
 		return nil
 	}
-	space := &TASSpace{
+	return &TASSpace{
 		EntityID:   getStr(m, "entityId"),
 		EntityName: getStr(m, "entityName"),
 	}
-	if entitiesIn, ok := m["entitiesIn"].(map[string]interface{}); ok {
-		if entities, ok := entitiesIn["entities"].([]interface{}); ok {
-			for _, pba := range entities {
-				if pm, ok := pba.(map[string]interface{}); ok {
-					if id := getStr(pm, "entityId"); id != "" {
-						space.PBAIDs = append(space.PBAIDs, id)
-					}
-				}
-			}
-		}
-	}
-	return space
 }
 
 func getStr(m map[string]interface{}, key string) string {
@@ -414,14 +394,14 @@ func getStr(m map[string]interface{}, key string) string {
 // Business application mutation
 
 // UpsertBusinessApplication creates or updates a business application in Hub.
-// name is the display name for the BA; pbaIDs are the PotentialBusinessApplication
-// entity IDs that should be linked to it.
+// name is the display name for the BA; spaceIDs are the TAS space entity IDs
+// that should be linked to it.
 //
-// The PBA IDs are embedded inline in the query document (not as variables) because
-// Hub's EntityId custom scalar does not coerce correctly when passed via variables.
-func (c *HubClient) UpsertBusinessApplication(name string, pbaIDs []string) (*BAUpsertResult, error) {
-	quotedIDs := make([]string, len(pbaIDs))
-	for i, id := range pbaIDs {
+// The space IDs are embedded inline in the query document (not as variables)
+// because Hub's EntityId custom scalar does not coerce correctly when passed via variables.
+func (c *HubClient) UpsertBusinessApplication(name string, spaceIDs []string) (*BAUpsertResult, error) {
+	quotedIDs := make([]string, len(spaceIDs))
+	for i, id := range spaceIDs {
 		quotedIDs[i] = fmt.Sprintf("%q", id)
 	}
 	mutation := fmt.Sprintf(`
@@ -604,10 +584,10 @@ func main() {
 
 	// Group matching spaces by extracted AD identifier
 	type BAGroup struct {
-		ADID   string
-		BAName string
-		Spaces []string
-		PBAIDs []string
+		ADID     string
+		BAName   string
+		Spaces   []string
+		SpaceIDs []string
 	}
 
 	groups := make(map[string]*BAGroup)
@@ -632,18 +612,16 @@ func main() {
 
 		g.Spaces = append(g.Spaces, space.EntityName)
 
-		// Collect PBA IDs, deduplicating
-		for _, pbaID := range space.PBAIDs {
-			duplicate := false
-			for _, existing := range g.PBAIDs {
-				if existing == pbaID {
-					duplicate = true
-					break
-				}
+		// Collect TAS space IDs, deduplicating
+		duplicate := false
+		for _, existing := range g.SpaceIDs {
+			if existing == space.EntityID {
+				duplicate = true
+				break
 			}
-			if !duplicate {
-				g.PBAIDs = append(g.PBAIDs, pbaID)
-			}
+		}
+		if !duplicate {
+			g.SpaceIDs = append(g.SpaceIDs, space.EntityID)
 		}
 	}
 
@@ -660,8 +638,8 @@ func main() {
 	if listSpaces || generateMode {
 		for _, adID := range adIDs {
 			g := groups[adID]
-			fmt.Printf("AD ID: %-14s  BA Name: %-40s  Spaces: %d  PBA IDs: %d\n",
-				g.ADID, g.BAName, len(g.Spaces), len(g.PBAIDs))
+			fmt.Printf("AD ID: %-14s  BA Name: %-40s  Spaces: %d  Space IDs: %d\n",
+				g.ADID, g.BAName, len(g.Spaces), len(g.SpaceIDs))
 			for _, s := range g.Spaces {
 				fmt.Printf("    - %s\n", s)
 			}
@@ -678,8 +656,8 @@ func main() {
 		fmt.Println("--- DRY RUN: no mutations will be executed ---")
 		for _, adID := range adIDs {
 			g := groups[adID]
-			fmt.Printf("[DRY RUN] upsertBusinessApplications  name=%q  pbaIDs=%v\n",
-				g.BAName, g.PBAIDs)
+			fmt.Printf("[DRY RUN] upsertBusinessApplications  name=%q  spaceIDs=%v\n",
+				g.BAName, g.SpaceIDs)
 		}
 		return
 	}
@@ -690,14 +668,14 @@ func main() {
 
 	for _, adID := range adIDs {
 		g := groups[adID]
-		if len(g.PBAIDs) == 0 {
-			fmt.Printf("[SKIP]  %s (%s): no PotentialBusinessApplication IDs found for this group\n",
+		if len(g.SpaceIDs) == 0 {
+			fmt.Printf("[SKIP]  %s (%s): no TAS space IDs found for this group\n",
 				adID, g.BAName)
 			skipCount++
 			continue
 		}
 
-		result, err := client.UpsertBusinessApplication(g.BAName, g.PBAIDs)
+		result, err := client.UpsertBusinessApplication(g.BAName, g.SpaceIDs)
 		if err != nil {
 			fmt.Printf("[ERROR] %s (%s): %v\n", adID, g.BAName, err)
 			failCount++
@@ -712,6 +690,6 @@ func main() {
 		}
 	}
 
-	fmt.Printf("\nDone. %d created/updated, %d skipped (no PBA IDs), %d failed.\n",
+	fmt.Printf("\nDone. %d created/updated, %d skipped (no TAS space IDs), %d failed.\n",
 		successCount, skipCount, failCount)
 }
