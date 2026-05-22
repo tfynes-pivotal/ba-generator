@@ -174,3 +174,4 @@ skipped automatically when the config is absent.
 
 Unit tests (`TestExtractADID`, `TestLoadADNameMap`) run without any external
 connectivity.
+...
