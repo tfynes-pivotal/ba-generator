@@ -161,11 +161,59 @@ AD ID: ad87654321     BA Name: Identity Service                Spaces: 2  PBA ID
 Done. 23 created/updated, 0 skipped (no PBA IDs), 0 failed.
 ```
 
+## BA Deleter (companion utility)
+
+`ba-deleter` removes business applications from Hub. You select them either
+by **explicit name** or by a **regular expression** matched against the BA
+name. It reads the same `hub-api-config.json` from the working directory.
+
+```bash
+go build -o ba-deleter ./cmd/ba-deleter
+```
+
+```
+Usage:
+  ba-deleter -list [-regex <pattern>]
+  ba-deleter [-dry-run] [-yes] -names "BA One,BA Two" [more names...]
+  ba-deleter [-dry-run] [-yes] -names-file <file>
+  ba-deleter [-dry-run] [-yes] -regex <pattern>
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `-names` | — | Comma-separated BA names (exact, case-sensitive). Positional args are also treated as names |
+| `-names-file` | — | File with one BA name per line (`#` comments and blank lines ignored) |
+| `-regex` | — | Delete every BA whose name matches (unanchored: use `^...$` for a full match) |
+| `-list` | — | List existing BAs (filtered by `-regex` if given) and exit |
+| `-dry-run` | — | Show what would be deleted; no mutation is called |
+| `-yes` | — | Skip the interactive `yes` confirmation |
+| `-batch-size` | `50` | BAs deleted per `deleteBusinessApplications` call |
+| `-page-size` | `1000` | BAs fetched per list request |
+| `-endpoint`, `-token`, `-insecure`, `-debug` | — | Same as ba-generator |
+
+You can supply names or `-regex`, but not both in the same run. Names that
+match no BA are reported as `[NOT FOUND]`. If several BAs share a name, all of
+them are deleted.
+
+```bash
+# Preview: every BA whose name is a raw AD identifier (e.g. created without a CSV map)
+./ba-deleter -regex '^ad\d{8}$' -dry-run
+
+# Delete them (asks you to type 'yes')
+./ba-deleter -regex '^ad\d{8}$'
+
+# Delete specific BAs, non-interactively
+./ba-deleter -names "Payments Platform,Identity Service" -yes
+```
+
+The process exits with status `2` if any deletion failed.
+
 ## Testing
 
 ```bash
 go build -o ba-generator .
 go test -v -count=1
+go test -v -count=1 ./cmd/ba-deleter   # ba-deleter unit tests (no Hub needed)
 ```
 
 Integration tests (those prefixed `Test*` that call Hub) require
