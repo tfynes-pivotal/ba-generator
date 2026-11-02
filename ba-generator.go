@@ -254,12 +254,18 @@ func (c *HubClient) ExecuteQuery(query string, variables map[string]interface{})
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
+		if c.debug {
+			log.Printf("[DEBUG] request body that failed:\n%s", reqBody)
+		}
 		return nil, fmt.Errorf("error sending request: %v", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		if c.debug {
+			log.Printf("[DEBUG] request body that failed:\n%s", reqBody)
+		}
 		return nil, fmt.Errorf("error reading response: %v", err)
 	}
 
@@ -269,10 +275,14 @@ func (c *HubClient) ExecuteQuery(query string, variables map[string]interface{})
 
 	var result GraphQLResponse
 	if err := json.Unmarshal(body, &result); err != nil {
+		if c.debug {
+			log.Printf("[DEBUG] request body that failed:\n%s", reqBody)
+		}
 		return nil, fmt.Errorf("error parsing response: %v", err)
 	}
 	if len(result.Errors) > 0 {
 		if c.debug {
+			log.Printf("[DEBUG] request body for failed GraphQL response:\n%s", reqBody)
 			for i, e := range result.Errors {
 				log.Printf("[DEBUG] GraphQL error[%d]: message=%q errorMsg=%q errorType=%q entityId=%q entityName=%q extensions=%v",
 					i, e.Message, e.ErrorMsg, e.ErrorType, e.EntityID, e.EntityName, e.Extensions)
@@ -290,11 +300,16 @@ func (c *HubClient) ExecuteQuery(query string, variables map[string]interface{})
 // Domain types
 
 // TASSpace represents a single TAS space entity returned from Hub, together
-// with the PotentialBusinessApplication entity IDs linked to it.
+// with the entity IDs used to attach it to a business application.
+//
+// Hub v11 removed PotentialBusinessApplication entities; every TAS space is now
+// wrapped 1:1 by a Tanzu.Platform.SpaceGroup, and a BA is built by passing the
+// SpaceGroup IDs in potentialBusinessApps (Hub then links both the SpaceGroup
+// and its TAS space to the BA). Older Hubs used PBA IDs instead.
 type TASSpace struct {
 	EntityID   string
 	EntityName string
-	PBAIDs     []string // PotentialBusinessApplication entity IDs
+	MemberIDs  []string // SpaceGroup IDs (Hub v11+), or PotentialBusinessApplication IDs on older Hubs
 }
 
 // BAUpsertResult carries the outcome of a single upsertBusinessApplications call.
@@ -322,6 +337,12 @@ query listTASSpaces($first: Int!, $after: String) {
       entities {
         entityId
         entityName
+        entitiesOut(entityType: "Tanzu.Platform.SpaceGroup") {
+          entities {
+            entityId
+            entityName
+          }
+        }
         entitiesIn(entityType: "Tanzu.Hub.PotentialBusinessApplication") {
           entities {
             entityId
@@ -381,6 +402,75 @@ func (c *HubClient) ListAllSpaces(pageSize int, queryCount *int) ([]TASSpace, er
 	return out, nil
 }
 
+// Business application query
+
+const listBAsQuery = `
+query listBusinessApplications($first: Int!, $after: String) {
+  entityQuery {
+    queryEntities(
+      entityType: "Tanzu.Hub.BusinessApplication"
+      first: $first
+      after: $after
+    ) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      entities {
+        entityId
+        entityName
+      }
+    }
+  }
+}`
+
+// ListAllBusinessApplications returns a map of entityName -> entityId for every
+// existing BusinessApplication in Hub. Used to distinguish create from update.
+func (c *HubClient) ListAllBusinessApplications(pageSize int) (map[string]string, error) {
+	vars := map[string]interface{}{"first": pageSize}
+	out := make(map[string]string)
+	after := ""
+
+	for {
+		if after != "" {
+			vars["after"] = after
+		} else {
+			delete(vars, "after")
+		}
+
+		resp, err := c.ExecuteQuery(listBAsQuery, vars)
+		if err != nil {
+			return nil, err
+		}
+
+		eq, _ := resp.Data["entityQuery"].(map[string]interface{})
+		qe, _ := eq["queryEntities"].(map[string]interface{})
+		entities, _ := qe["entities"].([]interface{})
+
+		for _, e := range entities {
+			if m, ok := e.(map[string]interface{}); ok {
+				name := getStr(m, "entityName")
+				id := getStr(m, "entityId")
+				if name != "" {
+					out[name] = id
+				}
+			}
+		}
+
+		pageInfo, _ := qe["pageInfo"].(map[string]interface{})
+		hasNext, _ := pageInfo["hasNextPage"].(bool)
+		if !hasNext {
+			break
+		}
+		cursor, _ := pageInfo["endCursor"].(string)
+		if cursor == "" {
+			break
+		}
+		after = cursor
+	}
+	return out, nil
+}
+
 func parseTASSpace(e interface{}) *TASSpace {
 	m, ok := e.(map[string]interface{})
 	if !ok {
@@ -390,18 +480,29 @@ func parseTASSpace(e interface{}) *TASSpace {
 		EntityID:   getStr(m, "entityId"),
 		EntityName: getStr(m, "entityName"),
 	}
-	if entitiesIn, ok := m["entitiesIn"].(map[string]interface{}); ok {
-		if entities, ok := entitiesIn["entities"].([]interface{}); ok {
-			for _, pba := range entities {
-				if pm, ok := pba.(map[string]interface{}); ok {
-					if id := getStr(pm, "entityId"); id != "" {
-						space.PBAIDs = append(space.PBAIDs, id)
+	// Prefer SpaceGroup IDs (Hub v11+); fall back to PBA IDs for older Hubs.
+	space.MemberIDs = relatedIDs(m, "entitiesOut")
+	if len(space.MemberIDs) == 0 {
+		space.MemberIDs = relatedIDs(m, "entitiesIn")
+	}
+	return space
+}
+
+// relatedIDs returns the entityIds under m[key].entities.
+func relatedIDs(m map[string]interface{}, key string) []string {
+	var ids []string
+	if rel, ok := m[key].(map[string]interface{}); ok {
+		if entities, ok := rel["entities"].([]interface{}); ok {
+			for _, e := range entities {
+				if em, ok := e.(map[string]interface{}); ok {
+					if id := getStr(em, "entityId"); id != "" {
+						ids = append(ids, id)
 					}
 				}
 			}
 		}
 	}
-	return space
+	return ids
 }
 
 func getStr(m map[string]interface{}, key string) string {
@@ -414,14 +515,15 @@ func getStr(m map[string]interface{}, key string) string {
 // Business application mutation
 
 // UpsertBusinessApplication creates or updates a business application in Hub.
-// name is the display name for the BA; pbaIDs are the PotentialBusinessApplication
-// entity IDs that should be linked to it.
+// name is the display name for the BA; memberIDs are the SpaceGroup entity IDs
+// (Hub v11+) or PotentialBusinessApplication entity IDs (older Hubs) that should
+// be linked to it. Both go in the potentialBusinessApps input field.
 //
-// The PBA IDs are embedded inline in the query document (not as variables) because
+// The IDs are embedded inline in the query document (not as variables) because
 // Hub's EntityId custom scalar does not coerce correctly when passed via variables.
-func (c *HubClient) UpsertBusinessApplication(name string, pbaIDs []string) (*BAUpsertResult, error) {
-	quotedIDs := make([]string, len(pbaIDs))
-	for i, id := range pbaIDs {
+func (c *HubClient) UpsertBusinessApplication(name string, memberIDs []string) (*BAUpsertResult, error) {
+	quotedIDs := make([]string, len(memberIDs))
+	for i, id := range memberIDs {
 		quotedIDs[i] = fmt.Sprintf("%q", id)
 	}
 	mutation := fmt.Sprintf(`
@@ -604,10 +706,10 @@ func main() {
 
 	// Group matching spaces by extracted AD identifier
 	type BAGroup struct {
-		ADID   string
-		BAName string
-		Spaces []string
-		PBAIDs []string
+		ADID      string
+		BAName    string
+		Spaces    []string
+		MemberIDs []string
 	}
 
 	groups := make(map[string]*BAGroup)
@@ -632,17 +734,17 @@ func main() {
 
 		g.Spaces = append(g.Spaces, space.EntityName)
 
-		// Collect PBA IDs, deduplicating
-		for _, pbaID := range space.PBAIDs {
+		// Collect member (SpaceGroup/PBA) IDs, deduplicating
+		for _, memberID := range space.MemberIDs {
 			duplicate := false
-			for _, existing := range g.PBAIDs {
-				if existing == pbaID {
+			for _, existing := range g.MemberIDs {
+				if existing == memberID {
 					duplicate = true
 					break
 				}
 			}
 			if !duplicate {
-				g.PBAIDs = append(g.PBAIDs, pbaID)
+				g.MemberIDs = append(g.MemberIDs, memberID)
 			}
 		}
 	}
@@ -660,8 +762,8 @@ func main() {
 	if listSpaces || generateMode {
 		for _, adID := range adIDs {
 			g := groups[adID]
-			fmt.Printf("AD ID: %-14s  BA Name: %-40s  Spaces: %d  PBA IDs: %d\n",
-				g.ADID, g.BAName, len(g.Spaces), len(g.PBAIDs))
+			fmt.Printf("AD ID: %-14s  BA Name: %-40s  Spaces: %d  Member IDs: %d\n",
+				g.ADID, g.BAName, len(g.Spaces), len(g.MemberIDs))
 			for _, s := range g.Spaces {
 				fmt.Printf("    - %s\n", s)
 			}
@@ -678,40 +780,54 @@ func main() {
 		fmt.Println("--- DRY RUN: no mutations will be executed ---")
 		for _, adID := range adIDs {
 			g := groups[adID]
-			fmt.Printf("[DRY RUN] upsertBusinessApplications  name=%q  pbaIDs=%v\n",
-				g.BAName, g.PBAIDs)
+			fmt.Printf("[DRY RUN] upsertBusinessApplications  name=%q  memberIDs=%v\n",
+				g.BAName, g.MemberIDs)
 		}
 		return
 	}
 
-	successCount := 0
+	// Pre-fetch existing business applications so we can distinguish create from update.
+	fmt.Println("Fetching existing business applications from Hub...")
+	existingBAs, err := client.ListAllBusinessApplications(pageSize)
+	if err != nil {
+		log.Fatalf("Error fetching existing business applications: %v", err)
+	}
+	fmt.Printf("Found %d existing business application(s).\n\n", len(existingBAs))
+
+	createdCount := 0
+	updatedCount := 0
 	skipCount := 0
 	failCount := 0
 
 	for _, adID := range adIDs {
 		g := groups[adID]
-		if len(g.PBAIDs) == 0 {
-			fmt.Printf("[SKIP]  %s (%s): no PotentialBusinessApplication IDs found for this group\n",
+		if len(g.MemberIDs) == 0 {
+			fmt.Printf("[SKIP]    %s (%s): no SpaceGroup/PotentialBusinessApplication IDs found for this group\n",
 				adID, g.BAName)
 			skipCount++
 			continue
 		}
 
-		result, err := client.UpsertBusinessApplication(g.BAName, g.PBAIDs)
+		_, alreadyExists := existingBAs[g.BAName]
+
+		result, err := client.UpsertBusinessApplication(g.BAName, g.MemberIDs)
 		if err != nil {
-			fmt.Printf("[ERROR] %s (%s): %v\n", adID, g.BAName, err)
+			fmt.Printf("[ERROR]   %s (%s): %v\n", adID, g.BAName, err)
 			failCount++
 			continue
 		}
 		if result.ErrorMsg != "" {
-			fmt.Printf("[ERROR] %s (%s): %s\n", adID, g.BAName, result.ErrorMsg)
+			fmt.Printf("[ERROR]   %s (%s): %s\n", adID, g.BAName, result.ErrorMsg)
 			failCount++
+		} else if alreadyExists {
+			fmt.Printf("[UPDATED] %s (%s): entityId=%s\n", adID, g.BAName, result.EntityID)
+			updatedCount++
 		} else {
-			fmt.Printf("[OK]    %s (%s): entityId=%s\n", adID, g.BAName, result.EntityID)
-			successCount++
+			fmt.Printf("[CREATED] %s (%s): entityId=%s\n", adID, g.BAName, result.EntityID)
+			createdCount++
 		}
 	}
 
-	fmt.Printf("\nDone. %d created/updated, %d skipped (no PBA IDs), %d failed.\n",
-		successCount, skipCount, failCount)
+	fmt.Printf("\nDone. %d created, %d updated, %d skipped (no member IDs), %d failed.\n",
+		createdCount, updatedCount, skipCount, failCount)
 }
